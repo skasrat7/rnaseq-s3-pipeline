@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+S3 FastQ Scanner for nf-core/rnaseq Input Samplesheet Generation
+
+This script scans an S3 folder for FastQ files and creates a CSV file
+that can be used as input for the nf-core/rnaseq pipeline.
+
+Usage:
+    python create_rnaseq_input.py s3://bucket/folder/ output.csv
+
+Requirements:
+    - boto3 (AWS SDK for Python)
+    - pandas
+    - argparse
+"""
+
+import boto3
+import pandas as pd
+import argparse
+import re
+import sys
+from urllib.parse import urlparse
+from pathlib import Path
+
+
+def parse_s3_url(s3_url):
+    """Parse S3 URL and return bucket and prefix."""
+    parsed = urlparse(s3_url)
+    if parsed.scheme != 's3':
+        raise ValueError(f"Invalid S3 URL: {s3_url}")
+    
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip('/')
+    
+    return bucket, prefix
+
+
+def get_fastq_files(s3_client, bucket, prefix):
+    """Get all FastQ files from S3 folder."""
+    fastq_files = []
+    
+    try:
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+        
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    if is_fastq_file(key):
+                        fastq_files.append(key)
+        
+        return sorted(fastq_files)
+    
+    except Exception as e:
+        print(f"Error listing S3 objects: {e}")
+        return []
+
+
+def is_fastq_file(filename):
+    """Check if file is a FastQ file."""
+    fastq_extensions = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
+    return any(filename.lower().endswith(ext) for ext in fastq_extensions)
+
+
+def extract_sample_info(fastq_files):
+    """Extract sample information from FastQ filenames."""
+    samples = {}
+    
+    # Common patterns for paired-end FastQ files
+    patterns = [
+        r'(.+?)_R?1[._].*\.(fastq|fq)(?:\.gz)?$',  # R1 files
+        r'(.+?)_R?2[._].*\.(fastq|fq)(?:\.gz)?$',  # R2 files
+        r'(.+?)_1[._].*\.(fastq|fq)(?:\.gz)?$',    # _1 files
+        r'(.+?)_2[._].*\.(fastq|fq)(?:\.gz)?$',    # _2 files
+        r'(.+?)\.1\.(fastq|fq)(?:\.gz)?$',          # .1. files
+        r'(.+?)\.2\.(fastq|fq)(?:\.gz)?$',          # .2. files
+    ]
+    
+    for file_path in fastq_files:
+        filename = Path(file_path).name
+        
+        # Try to match patterns
+        sample_name = None
+        is_r1 = False
+        
+        for pattern in patterns:
+            match = re.match(pattern, filename, re.IGNORECASE)
+            if match:
+                sample_name = match.group(1)
+                # Check if it's R1/1 file
+                if 'R1' in filename or '_1' in filename or '.1.' in filename:
+                    is_r1 = True
+                break
+        
+        if sample_name:
+            if sample_name not in samples:
+                samples[sample_name] = {'fastq_1': None, 'fastq_2': None}
+            
+            if is_r1:
+                samples[sample_name]['fastq_1'] = file_path
+            else:
+                samples[sample_name]['fastq_2'] = file_path
+    
+    return samples
+
+
+def create_csv_data(samples, s3_bucket, strandedness="auto"):
+    """Create CSV data for nf-core/rnaseq."""
+    csv_data = []
+    
+    for sample_name, files in samples.items():
+        # Convert S3 paths to full S3 URLs
+        fastq_1 = f"s3://{s3_bucket}/{files['fastq_1']}" if files['fastq_1'] else ""
+        fastq_2 = f"s3://{s3_bucket}/{files['fastq_2']}" if files['fastq_2'] else ""
+        
+        # Only include samples with both R1 and R2 files
+        if fastq_1 and fastq_2:
+            csv_data.append({
+                'sample': sample_name,
+                'fastq_1': fastq_1,
+                'fastq_2': fastq_2,
+                'strandedness': strandedness
+            })
+        else:
+            print(f"Warning: Sample '{sample_name}' missing paired files:")
+            print(f"  R1: {fastq_1}")
+            print(f"  R2: {fastq_2}")
+    
+    return csv_data
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create nf-core/rnaseq input CSV from S3 folder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+                epilog="""
+ Examples:
+   python create_rnaseq_input.py s3://my-bucket/rnaseq-data/ samples.csv
+   python create_rnaseq_input.py s3://bucket/folder/ -o output.csv
+   python create_rnaseq_input.py s3://bucket/folder/ --strandedness forward
+   python create_rnaseq_input.py s3://bucket/folder/ --strandedness reverse --dry-run
+         """
+    )
+    
+    parser.add_argument('s3_url', help='S3 URL to scan (e.g., s3://bucket/folder/)')
+    parser.add_argument('-o', '--output', default='samples.csv', 
+                       help='Output CSV filename (default: samples.csv)')
+    parser.add_argument('--strandedness', default='auto', 
+                       choices=['auto', 'forward', 'reverse', 'unstranded'],
+                       help='Strandedness for RNA-seq analysis (default: auto)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be created without writing file')
+    
+    args = parser.parse_args()
+    
+    # Parse S3 URL
+    try:
+        bucket, prefix = parse_s3_url(args.s3_url)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    print(f"Scanning S3 bucket: {bucket}")
+    print(f"Folder prefix: {prefix}")
+    print("-" * 50)
+    
+    # Initialize S3 client
+    try:
+        s3_client = boto3.client('s3')
+        # Test connection
+        s3_client.head_bucket(Bucket=bucket)
+    except Exception as e:
+        print(f"Error connecting to S3: {e}")
+        print("Make sure you have AWS credentials configured (aws configure)")
+        sys.exit(1)
+    
+    # Get FastQ files
+    print("Finding FastQ files...")
+    fastq_files = get_fastq_files(s3_client, bucket, prefix)
+    
+    if not fastq_files:
+        print("No FastQ files found in the specified S3 folder.")
+        sys.exit(1)
+    
+    print(f"Found {len(fastq_files)} FastQ files")
+    
+    # Extract sample information
+    print("Extracting sample information...")
+    samples = extract_sample_info(fastq_files)
+    
+    if not samples:
+        print("No valid sample pairs found.")
+        sys.exit(1)
+    
+    print(f"Found {len(samples)} potential samples")
+    
+    # Create CSV data
+    csv_data = create_csv_data(samples, bucket, args.strandedness)
+    
+    if not csv_data:
+        print("No complete sample pairs found. Check your FastQ file naming.")
+        sys.exit(1)
+    
+    print(f"\nCreating CSV with {len(csv_data)} complete sample pairs:")
+    print(f"Strandedness setting: {args.strandedness}")
+    print("-" * 50)
+    
+    # Display what will be created
+    for sample in csv_data:
+        print(f"Sample: {sample['sample']}")
+        print(f"  R1: {sample['fastq_1']}")
+        print(f"  R2: {sample['fastq_2']}")
+        print(f"  Strandedness: {sample['strandedness']}")
+        print()
+    
+    if args.dry_run:
+        print("Dry run mode - no file written.")
+        return
+    
+    # Write CSV file
+    try:
+        df = pd.DataFrame(csv_data)
+        df.to_csv(args.output, index=False)
+        print(f"✅ CSV file created successfully: {args.output}")
+        print(f"📊 Total samples: {len(csv_data)}")
+        print(f"🔗 Use this file with: --input {args.output}")
+        
+    except Exception as e:
+        print(f"Error writing CSV file: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
