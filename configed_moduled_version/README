@@ -1,0 +1,19 @@
+Syntax for Running
+Here's the exact syntax:
+First Time Setup:
+
+1. Edit configuration files with your specific paths/settings
+nano nextflow.config  # Update S3 paths, input CSV, etc.
+
+2. Make script executable
+chmod +x run_pipeline.sh
+
+3. Run the workflow
+./run_pipeline.sh
+
+Manual Execution (alternative):
+# Prepare references (first time only)
+nextflow run prep_references.nf
+
+# Run main pipeline  
+nextflow run nf-core/rnaseq -c nextflow.config -profile local -resume
